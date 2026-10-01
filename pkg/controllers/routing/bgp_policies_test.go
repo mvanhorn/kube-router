@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -14,11 +16,17 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
 
+	"github.com/ccoveille/go-safecast/v2"
+	"github.com/cloudnativelabs/kube-router/v2/pkg/k8s/indexers"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/utils"
 	gobgpapi "github.com/osrg/gobgp/v4/api"
+	"github.com/osrg/gobgp/v4/pkg/apiutil"
+	bgppkt "github.com/osrg/gobgp/v4/pkg/packet/bgp"
 	gobgp "github.com/osrg/gobgp/v4/pkg/server"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -4392,4 +4400,610 @@ func checkDefinedSet(t *testing.T, nrc *NetworkRoutingController, name string,
 		t.Logf("actual %s defined set: %+v", name, actual)
 		t.Errorf("unexpected %s defined set contents", name)
 	}
+}
+
+const (
+	policyLocalASN = uint32(100)
+
+	exportControllerASN = uint32(65001)
+	exportExternalASN   = uint32(65002)
+	exportObserverASN   = uint32(65003)
+
+	exportPodCIDR    = "10.244.1.0/24"
+	exportServiceVIP = "10.96.0.10"
+
+	exportControllerAddr = "127.0.0.1"
+	exportExternalAddr   = "127.0.0.2"
+	exportObserverAddr   = "127.0.0.3"
+	exportInternalAddr   = "127.0.0.4"
+	exportControlAddr    = "127.0.0.9"
+
+	bgpSessionTimeout = 5 * time.Second
+	bgpRouteTimeout   = 3 * time.Second
+	bgpAbsenceWindow  = time.Second
+	bgpPollInterval   = 50 * time.Millisecond
+)
+
+// iBGPPeerSetCase is one non-full-mesh or full-mesh membership scenario. Nodes are inserted into
+// the indexer directly: an unstarted informer cache is empty and would hide the filter.
+type iBGPPeerSetCase struct {
+	name           string
+	fullMesh       bool
+	enableInternal bool
+	nodes          []*v1core.Node
+	externalV4     []string
+	externalV6     []string
+	wantV4         []string
+	wantV6         []string
+}
+
+func Test_iBGPPeerSetMembership(t *testing.T) {
+	externalV4 := []string{"10.50.0.1"}
+	testcases := []iBGPPeerSetCase{
+		{
+			name:           "matching IPv4 ASN is included",
+			enableInternal: true,
+			nodes: []*v1core.Node{
+				policyTestNode("match-v4", "10.1.0.2", "100"),
+			},
+			externalV4: externalV4,
+			wantV4:     []string{"10.1.0.2/32"},
+		},
+		{
+			name:           "matching IPv6 ASN is included",
+			enableInternal: true,
+			nodes: []*v1core.Node{
+				policyTestNode("match-v6", "2001:db8::2", "100"),
+			},
+			externalV4: externalV4,
+			wantV6:     []string{"2001:db8::2/128"},
+		},
+		{
+			name:           "base-0 ASN annotations are accepted",
+			enableInternal: true,
+			nodes: []*v1core.Node{
+				// 0x64 and 0144 are both 100 when parsed with base 0.
+				policyTestNode("hex-v4", "10.1.0.3", "0x64"),
+				policyTestNode("octal-v6", "2001:db8::3", "0144"),
+			},
+			externalV4: externalV4,
+			wantV4:     []string{"10.1.0.3/32"},
+			wantV6:     []string{"2001:db8::3/128"},
+		},
+		{
+			name:           "different ASN is excluded",
+			enableInternal: true,
+			nodes: []*v1core.Node{
+				policyTestNode("different", "10.1.0.4", "200"),
+			},
+			externalV4: externalV4,
+		},
+		{
+			name:           "missing ASN is excluded",
+			enableInternal: true,
+			nodes: []*v1core.Node{
+				policyTestNode("missing", "10.1.0.5", ""),
+			},
+			externalV4: externalV4,
+		},
+		{
+			name:           "malformed ASN is excluded",
+			enableInternal: true,
+			nodes: []*v1core.Node{
+				policyTestNode("malformed", "10.1.0.6", "bad-asn"),
+			},
+			externalV4: externalV4,
+		},
+		{
+			name:           "overflowing ASN is excluded",
+			enableInternal: true,
+			nodes: []*v1core.Node{
+				// One past the 32-bit maximum accepted by ParseUint(..., asnMaxBitSize).
+				policyTestNode("overflow", "10.1.0.7", "4294967296"),
+			},
+			externalV4: externalV4,
+		},
+		{
+			name:           "non-full-mesh keeps only same-ASN peers",
+			enableInternal: true,
+			nodes: []*v1core.Node{
+				policyTestNode("match-v4", "10.1.0.2", "100"),
+				policyTestNode("match-v6", "2001:db8::2", "100"),
+				policyTestNode("hex-v4", "10.1.0.3", "0x64"),
+				policyTestNode("different", "10.1.0.4", "200"),
+				policyTestNode("missing", "10.1.0.5", ""),
+				policyTestNode("malformed", "10.1.0.6", "bad-asn"),
+				policyTestNode("overflow", "10.1.0.7", "4294967296"),
+			},
+			externalV4: externalV4,
+			externalV6: []string{"2001:db8:ffff::1"},
+			wantV4:     []string{"10.1.0.2/32", "10.1.0.3/32"},
+			wantV6:     []string{"2001:db8::2/128"},
+		},
+		{
+			name:           "full mesh includes nodes without ASN annotations",
+			fullMesh:       true,
+			enableInternal: true,
+			nodes: []*v1core.Node{
+				policyTestNode("no-asn-v4", "10.2.0.2", ""),
+				policyTestNode("other-asn-v4", "10.2.0.3", "200"),
+				policyTestNode("no-asn-v6", "2001:db8::8", ""),
+			},
+			externalV4: externalV4,
+			wantV4:     []string{"10.2.0.2/32", "10.2.0.3/32"},
+			wantV6:     []string{"2001:db8::8/128"},
+		},
+		{
+			name:           "internal peering disabled leaves iBGP sets empty",
+			enableInternal: false,
+			nodes: []*v1core.Node{
+				policyTestNode("same-asn", "10.3.0.2", "100"),
+				policyTestNode("no-asn", "10.3.0.3", ""),
+			},
+			externalV4: externalV4,
+			externalV6: []string{"2001:db8:ffff::1"},
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := applyPeerSetPolicies(t, tc)
+			assertPeerSets(t, server, tc.wantV4, tc.wantV6, tc.externalV4, tc.externalV6)
+		})
+	}
+}
+
+func Test_iBGPPeerSetReconcilesASNChanges(t *testing.T) {
+	const (
+		externalIP = "10.50.0.1"
+		v4IP       = "10.8.0.2"
+		v6IP       = "2001:db8::8"
+	)
+	server := startPolicyBGPServer(t, policyLocalASN, "10.255.0.1")
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	nrc := newPeerSetController(server, indexer, false, true, []string{externalIP}, nil)
+
+	v4Node := func(asn string) *v1core.Node { return policyTestNode("node-v4", v4IP, asn) }
+	v6Node := func(asn string) *v1core.Node { return policyTestNode("node-v6", v6IP, asn) }
+	apply := func(nodes ...*v1core.Node) {
+		t.Helper()
+		setIndexedNodes(t, indexer, nodes...)
+		require.NoError(t, nrc.AddPolicies())
+	}
+
+	apply(v4Node("100"), v6Node("100"))
+	assertPeerSets(t, server, []string{v4IP + "/32"}, []string{v6IP + "/128"}, []string{externalIP}, nil)
+
+	// A previously admitted address leaves the set when its ASN no longer matches.
+	apply(v4Node("200"), v6Node("100"))
+	assertPeerSets(t, server, nil, []string{v6IP + "/128"}, []string{externalIP}, nil)
+
+	// Removing the annotation keeps the address out.
+	apply(v4Node(""), v6Node("100"))
+	assertPeerSets(t, server, nil, []string{v6IP + "/128"}, []string{externalIP}, nil)
+
+	// Both families can transition all the way to empty.
+	apply(v4Node(""), v6Node(""))
+	assertPeerSets(t, server, nil, nil, []string{externalIP}, nil)
+
+	// Restoring a matching annotation, including base-0 syntax, brings the address back.
+	apply(v4Node("100"), v6Node("0x64"))
+	assertPeerSets(t, server, []string{v4IP + "/32"}, []string{v6IP + "/128"}, []string{externalIP}, nil)
+}
+
+func Test_PodCIDRExportSkipsDifferentASNOverlap(t *testing.T) {
+	testcases := []struct {
+		name             string
+		nodeIP           string
+		advertisePodCidr bool
+	}{
+		{
+			name:   "candidate overlap with advertisement disabled",
+			nodeIP: exportExternalAddr,
+		},
+		{
+			name:   "control node address with advertisement disabled",
+			nodeIP: exportControlAddr,
+		},
+		{
+			name:             "external export with advertisement enabled",
+			nodeIP:           exportExternalAddr,
+			advertisePodCidr: true,
+		},
+	}
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			runPodCIDRExport(t, tc.nodeIP, tc.advertisePodCidr)
+		})
+	}
+}
+
+func runPodCIDRExport(t *testing.T, differentASNNodeIP string, advertisePodCidr bool) {
+	t.Helper()
+
+	controller := startLoopbackSpeaker(t, exportControllerASN, exportControllerAddr, "10.255.0.1")
+	external := startLoopbackSpeaker(t, exportExternalASN, exportExternalAddr, "10.255.0.2")
+	observer := startLoopbackSpeaker(t, exportObserverASN, exportObserverAddr, "10.255.0.3")
+	internal := startLoopbackSpeaker(t, exportControllerASN, exportInternalAddr, "10.255.0.4")
+
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	require.NoError(t, indexer.Add(policyTestNode("different-asn", differentASNNodeIP, asnAnnotation(exportExternalASN))))
+	require.NoError(t, indexer.Add(policyTestNode("same-asn", exportInternalAddr, asnAnnotation(exportControllerASN))))
+
+	svcIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	require.NoError(t, svcIndexer.Add(exportClusterIPService()))
+
+	// getVIPs asks the endpoint-slice index even for cluster traffic policy. A nil lister panics,
+	// and a missing slice drops the VIP before the export policy is built.
+	nodeName := "controller"
+	epIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{
+		indexers.ServiceNameIndex: indexers.ServiceNameIndexFunc,
+	})
+	require.NoError(t, epIndexer.Add(&discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "svc-1",
+			Namespace: "default",
+			Labels:    map[string]string{discoveryv1.LabelServiceName: "svc-1"},
+		},
+		Endpoints: []discoveryv1.Endpoint{{
+			Addresses: []string{exportControllerAddr},
+			NodeName:  &nodeName,
+		}},
+	}))
+
+	externalPort, err := safecast.Convert[uint32](external.port)
+	require.NoError(t, err)
+
+	nrc := &NetworkRoutingController{
+		bgpServer:          controller.server,
+		nodeLister:         indexer,
+		svcLister:          svcIndexer,
+		epSliceLister:      epIndexer,
+		bgpFullMeshMode:    false,
+		bgpEnableInternal:  true,
+		advertisePodCidr:   advertisePodCidr,
+		advertiseClusterIP: true,
+		nodeAsnNumber:      exportControllerASN,
+		podIPv4CIDRs:       []string{exportPodCIDR},
+		globalPeerRouters: []*gobgpapi.Peer{{
+			Conf: &gobgpapi.PeerConf{NeighborAddress: exportExternalAddr, PeerAsn: exportExternalASN},
+			Transport: &gobgpapi.Transport{
+				LocalAddress: exportControllerAddr,
+				RemotePort:   externalPort,
+			},
+		}},
+		krNode: &utils.LocalKRNode{KRNode: utils.KRNode{
+			NodeName:  "controller",
+			PrimaryIP: net.ParseIP(exportControllerAddr),
+			NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{
+				v1core.NodeInternalIP: {net.ParseIP(exportControllerAddr)},
+			},
+		}},
+	}
+	require.NoError(t, nrc.AddPolicies())
+
+	// The overlapping or control node is a different ASN, so only the same-ASN speaker is iBGP.
+	assertNeighborMembers(t, controller.server, iBGPPeerSet, []string{exportInternalAddr + "/32"})
+	assertNeighborMembers(t, controller.server, externalPeerSet, []string{exportExternalAddr + "/32"})
+	assertNeighborMembers(t, controller.server, allPeerSet,
+		[]string{exportExternalAddr + "/32", exportInternalAddr + "/32"})
+
+	// Controller dials the external and same-ASN peers. The observer dials the external peer so a
+	// leaked pod CIDR would be visible one AS further downstream.
+	addSpeakerPeer(t, controller, external, false)
+	addSpeakerPeer(t, controller, internal, false)
+	addSpeakerPeer(t, observer, external, false)
+	addSpeakerPeer(t, external, controller, true)
+	addSpeakerPeer(t, external, observer, true)
+	addSpeakerPeer(t, internal, controller, true)
+
+	waitUntil(t, bgpSessionTimeout, func() (bool, string) {
+		ext := peerSessionState(t, controller.server, exportExternalAddr)
+		same := peerSessionState(t, controller.server, exportInternalAddr)
+		obs := peerSessionState(t, external.server, exportObserverAddr)
+		ready := ext == "established" && same == "established" && obs == "established"
+		return ready, fmt.Sprintf("external=%s internal=%s observer=%s", ext, same, obs)
+	})
+
+	require.NoError(t, nrc.advertiseCIDRs([]string{exportPodCIDR}, net.ParseIP(exportControllerAddr)))
+	require.NoError(t, nrc.bgpAdvertiseVIP(exportServiceVIP))
+
+	vip := exportServiceVIP + "/32"
+	waitUntil(t, bgpRouteTimeout, func() (bool, string) {
+		vipExt := globalRIBHasPrefix(t, external.server, vip)
+		vipObs := globalRIBHasPrefix(t, observer.server, vip)
+		podInt := globalRIBHasPrefix(t, internal.server, exportPodCIDR)
+		ready := vipExt && vipObs && podInt
+		return ready, fmt.Sprintf("vip external=%v vip observer=%v pod internal=%v external=%v observer=%v internal=%v",
+			vipExt, vipObs, podInt,
+			ribPrefixes(t, external.server), ribPrefixes(t, observer.server), ribPrefixes(t, internal.server))
+	})
+
+	if advertisePodCidr {
+		waitUntil(t, bgpRouteTimeout, func() (bool, string) {
+			ext := globalRIBHasPrefix(t, external.server, exportPodCIDR)
+			obs := globalRIBHasPrefix(t, observer.server, exportPodCIDR)
+			return ext && obs, fmt.Sprintf("pod external=%v pod observer=%v external=%v observer=%v",
+				ext, obs, ribPrefixes(t, external.server), ribPrefixes(t, observer.server))
+		})
+		return
+	}
+
+	// Sessions are up and service VIPs have already crossed both hops. A pod CIDR accepted via the
+	// iBGP set would have arrived with them.
+	deadline := time.Now().Add(bgpAbsenceWindow)
+	for {
+		require.Falsef(t, globalRIBHasPrefix(t, external.server, exportPodCIDR),
+			"external peer received pod CIDR %s: %v", exportPodCIDR, ribPrefixes(t, external.server))
+		require.Falsef(t, globalRIBHasPrefix(t, observer.server, exportPodCIDR),
+			"observer received pod CIDR %s: %v", exportPodCIDR, ribPrefixes(t, observer.server))
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(bgpPollInterval)
+	}
+}
+
+func applyPeerSetPolicies(t *testing.T, tc iBGPPeerSetCase) *gobgp.BgpServer {
+	t.Helper()
+	server := startPolicyBGPServer(t, policyLocalASN, "10.255.0.1")
+	indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+	setIndexedNodes(t, indexer, tc.nodes...)
+	nrc := newPeerSetController(server, indexer, tc.fullMesh, tc.enableInternal, tc.externalV4, tc.externalV6)
+	require.NoError(t, nrc.AddPolicies())
+	return server
+}
+
+func newPeerSetController(server *gobgp.BgpServer, nodes cache.Indexer, fullMesh, enableInternal bool,
+	externalV4, externalV6 []string) *NetworkRoutingController {
+	return &NetworkRoutingController{
+		bgpServer:         server,
+		nodeLister:        nodes,
+		svcLister:         cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{}),
+		bgpFullMeshMode:   fullMesh,
+		bgpEnableInternal: enableInternal,
+		nodeAsnNumber:     policyLocalASN,
+		podIPv4CIDRs:      []string{"172.20.0.0/24"},
+		globalPeerRouters: peerRouters(append(slices.Clone(externalV4), externalV6...)),
+	}
+}
+
+func peerRouters(addresses []string) []*gobgpapi.Peer {
+	peers := make([]*gobgpapi.Peer, 0, len(addresses))
+	for _, address := range addresses {
+		peers = append(peers, &gobgpapi.Peer{
+			Conf: &gobgpapi.PeerConf{NeighborAddress: address},
+		})
+	}
+	return peers
+}
+
+func policyTestNode(name, address, asn string) *v1core.Node {
+	node := &v1core.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Status: v1core.NodeStatus{
+			Addresses: []v1core.NodeAddress{{
+				Type:    v1core.NodeInternalIP,
+				Address: address,
+			}},
+		},
+	}
+	if asn != "" {
+		node.Annotations = map[string]string{nodeASNAnnotation: asn}
+	}
+	return node
+}
+
+func setIndexedNodes(t *testing.T, indexer cache.Indexer, nodes ...*v1core.Node) {
+	t.Helper()
+	for _, obj := range indexer.List() {
+		require.NoError(t, indexer.Delete(obj))
+	}
+	for _, node := range nodes {
+		require.NoError(t, indexer.Add(node.DeepCopy()))
+	}
+}
+
+func exportClusterIPService() *v1core.Service {
+	return &v1core.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc-1", Namespace: "default"},
+		Spec: v1core.ServiceSpec{
+			Type:                  ClusterIPST,
+			ClusterIP:             exportServiceVIP,
+			InternalTrafficPolicy: &testClusterIntTrafPol,
+			ExternalTrafficPolicy: testClusterExtTrafPol,
+		},
+	}
+}
+
+func asnAnnotation(asn uint32) string {
+	return strconv.FormatUint(uint64(asn), 10)
+}
+
+func assertPeerSets(t *testing.T, server *gobgp.BgpServer, wantV4, wantV6, externalV4, externalV6 []string) {
+	t.Helper()
+	extV4 := withFamilyMask(externalV4, maxIPv4MaskSize)
+	extV6 := withFamilyMask(externalV6, maxIPv6MaskSize)
+	assertNeighborMembers(t, server, iBGPPeerSet, wantV4)
+	assertNeighborMembers(t, server, iBGPPeerSetV6, wantV6)
+	assertNeighborMembers(t, server, externalPeerSet, extV4)
+	assertNeighborMembers(t, server, externalPeerSetV6, extV6)
+	assertNeighborMembers(t, server, allPeerSet, append(slices.Clone(extV4), wantV4...))
+	assertNeighborMembers(t, server, allPeerSetV6, append(slices.Clone(extV6), wantV6...))
+}
+
+func withFamilyMask(addresses []string, bits uint32) []string {
+	masked := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		masked = append(masked, fmt.Sprintf("%s/%d", address, bits))
+	}
+	return masked
+}
+
+func assertNeighborMembers(t *testing.T, server *gobgp.BgpServer, name string, want []string) {
+	t.Helper()
+	require.Equal(t, sortedStrings(want), neighborSetMembers(t, server, name), name)
+}
+
+func neighborSetMembers(t *testing.T, server *gobgp.BgpServer, name string) []string {
+	t.Helper()
+	var members []string
+	err := server.ListDefinedSet(context.Background(), &gobgpapi.ListDefinedSetRequest{
+		DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_NEIGHBOR,
+		Name:        name,
+	}, func(ds *gobgpapi.DefinedSet) {
+		members = slices.Clone(ds.List)
+	})
+	require.NoError(t, err)
+	return sortedStrings(members)
+}
+
+func sortedStrings(values []string) []string {
+	sorted := slices.Clone(values)
+	slices.Sort(sorted)
+	if sorted == nil {
+		return []string{}
+	}
+	return sorted
+}
+
+func startPolicyBGPServer(t *testing.T, asn uint32, routerID string) *gobgp.BgpServer {
+	t.Helper()
+	server := gobgp.NewBgpServer()
+	go server.Serve()
+	require.NoError(t, server.StartBgp(context.Background(), &gobgpapi.StartBgpRequest{
+		Global: &gobgpapi.Global{
+			Asn:        asn,
+			RouterId:   routerID,
+			ListenPort: -1,
+		},
+	}))
+	t.Cleanup(func() {
+		if err := server.StopBgp(context.Background(), &gobgpapi.StopBgpRequest{}); err != nil {
+			t.Errorf("stop BGP server: %v", err)
+		}
+	})
+	return server
+}
+
+type loopbackSpeaker struct {
+	server  *gobgp.BgpServer
+	address string
+	port    int32
+	asn     uint32
+}
+
+func startLoopbackSpeaker(t *testing.T, asn uint32, address, routerID string) *loopbackSpeaker {
+	t.Helper()
+	port := freeTCPPort(t)
+	server := gobgp.NewBgpServer()
+	go server.Serve()
+	require.NoError(t, server.StartBgp(context.Background(), &gobgpapi.StartBgpRequest{
+		Global: &gobgpapi.Global{
+			Asn:             asn,
+			RouterId:        routerID,
+			ListenAddresses: []string{address},
+			ListenPort:      port,
+		},
+	}))
+	t.Cleanup(func() {
+		if err := server.StopBgp(context.Background(), &gobgpapi.StopBgpRequest{}); err != nil {
+			t.Errorf("stop BGP server %s: %v", address, err)
+		}
+	})
+	return &loopbackSpeaker{server: server, address: address, port: port, asn: asn}
+}
+
+func freeTCPPort(t *testing.T) int32 {
+	t.Helper()
+	lc := net.ListenConfig{}
+	listener, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+	port, err := safecast.Convert[int32](listener.Addr().(*net.TCPAddr).Port)
+	require.NoError(t, err)
+	return port
+}
+
+func addSpeakerPeer(t *testing.T, from, to *loopbackSpeaker, passive bool) {
+	t.Helper()
+	remotePort := uint32(0)
+	if !passive {
+		require.Positive(t, to.port)
+		var err error
+		remotePort, err = safecast.Convert[uint32](to.port)
+		require.NoError(t, err)
+	}
+	peer := &gobgpapi.Peer{
+		Conf: &gobgpapi.PeerConf{
+			NeighborAddress: to.address,
+			PeerAsn:         to.asn,
+		},
+		Transport: &gobgpapi.Transport{
+			LocalAddress: from.address,
+			RemotePort:   remotePort,
+			PassiveMode:  passive,
+		},
+		Timers: &gobgpapi.Timers{Config: &gobgpapi.TimersConfig{
+			ConnectRetry:           1,
+			IdleHoldTimeAfterReset: 1,
+		}},
+	}
+	require.NoError(t, from.server.AddPeer(context.Background(), &gobgpapi.AddPeerRequest{Peer: peer}))
+}
+
+func peerSessionState(t *testing.T, server *gobgp.BgpServer, address string) string {
+	t.Helper()
+	state := "absent"
+	err := server.ListPeer(context.Background(), &gobgpapi.ListPeerRequest{Address: address}, func(peer *gobgpapi.Peer) {
+		if peer.GetState() == nil {
+			state = "unknown"
+			return
+		}
+		state = strings.TrimPrefix(peer.GetState().GetSessionState().String(), "SESSION_STATE_")
+		state = strings.ToLower(state)
+	})
+	require.NoError(t, err)
+	return state
+}
+
+func waitUntil(t *testing.T, timeout time.Duration, cond func() (bool, string)) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var detail string
+	for {
+		ok, why := cond()
+		if ok {
+			return
+		}
+		detail = why
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out: %s", detail)
+		}
+		time.Sleep(bgpPollInterval)
+	}
+}
+
+func globalRIBHasPrefix(t *testing.T, server *gobgp.BgpServer, want string) bool {
+	t.Helper()
+	return slices.Contains(ribPrefixes(t, server), want)
+}
+
+func ribPrefixes(t *testing.T, server *gobgp.BgpServer) []string {
+	t.Helper()
+	prefixes := make([]string, 0)
+	err := server.ListPath(apiutil.ListPathRequest{
+		TableType: gobgpapi.TableType_TABLE_TYPE_GLOBAL,
+		Family:    bgppkt.NewFamily(bgppkt.AFI_IP, bgppkt.SAFI_UNICAST),
+	}, func(prefix bgppkt.NLRI, paths []*apiutil.Path) {
+		for _, path := range paths {
+			if path != nil && !path.Withdrawal {
+				prefixes = append(prefixes, prefix.String())
+				return
+			}
+		}
+	})
+	require.NoError(t, err)
+	slices.Sort(prefixes)
+	return prefixes
 }

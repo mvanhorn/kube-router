@@ -377,6 +377,31 @@ func (nrc *NetworkRoutingController) addiBGPPeersDefinedSet() (map[v1core.IPFami
 			klog.Errorf("Failed to find a node IP and therefore cannot add internal BGP Peer: %v", err)
 			continue
 		}
+		// Without a full mesh, only same-ASN nodes are iBGP peers. syncInternalPeers already skips
+		// missing, invalid, and different ASNs; the export set must too. Otherwise a different-ASN
+		// node whose address overlaps an external peer matches the pod CIDR accept statement.
+		if !nrc.bgpFullMeshMode {
+			nodeasn, ok := nodeObj.Annotations[nodeASNAnnotation]
+			if !ok {
+				klog.Infof("Not adding Node %s to iBGP peer set as ASN number of the node is unknown.",
+					targetNode.GetPrimaryNodeIP().String())
+				continue
+			}
+
+			asnNo, err := strconv.ParseUint(nodeasn, 0, asnMaxBitSize)
+			if err != nil {
+				klog.Infof("Not adding Node %s to iBGP peer set as ASN number of the node is invalid.",
+					targetNode.GetPrimaryNodeIP().String())
+				continue
+			}
+
+			// Skip when the node's ASN differs from this node's ASN.
+			if nrc.nodeAsnNumber != uint32(asnNo) {
+				klog.Infof("Not adding Node %s to iBGP peer set as ASN number of the node is different.",
+					targetNode.GetPrimaryNodeIP().String())
+				continue
+			}
+		}
 		if targetNode.GetPrimaryNodeIP().To4() != nil {
 			iBGPPeerCIDRs[v1core.IPv4Protocol] = append(iBGPPeerCIDRs[v1core.IPv4Protocol],
 				targetNode.GetPrimaryNodeIP().String()+"/32")
