@@ -4393,3 +4393,167 @@ func checkDefinedSet(t *testing.T, nrc *NetworkRoutingController, name string,
 		t.Errorf("unexpected %s defined set contents", name)
 	}
 }
+
+// Test_iBGPPeerSetMatchesInternalPeerSelection proves addiBGPPeersDefinedSet drops nodes that
+// syncInternalPeers would not peer with, including an eBGP neighbor whose address is also a Node
+// primary IP. Test_AddPolicies and Test_AddDefinedSetContents replace nodeLister with an unstarted
+// indexer, so this test creates the nodes, starts the informers, and leaves that lister in place.
+func Test_iBGPPeerSetMatchesInternalPeerSelection(t *testing.T) {
+	localIP := "10.50.0.1"
+	sameASNIP := "10.50.0.2"
+	ebgpIP := "10.50.0.3"
+	otherIP := "10.50.0.4"
+	missingASNIP := "10.50.0.5"
+	invalidASNIP := "10.50.0.6"
+	rrServerIP := "10.50.0.7"
+
+	node := func(name, ip string, annotations map[string]string) *v1core.Node {
+		return &v1core.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: annotations},
+			Status: v1core.NodeStatus{Addresses: []v1core.NodeAddress{{
+				Type:    v1core.NodeInternalIP,
+				Address: ip,
+			}}},
+		}
+	}
+	localNode := node("node-1", localIP, map[string]string{nodeASNAnnotation: "100"})
+	sameASNNode := node("node-same", sameASNIP, map[string]string{nodeASNAnnotation: "100"})
+	ebgpNode := node("node-ebgp", ebgpIP, map[string]string{nodeASNAnnotation: "200"})
+	otherASNNode := node("node-other", otherIP, map[string]string{nodeASNAnnotation: "200"})
+	missingASNNode := node("node-missing-asn", missingASNIP, nil)
+	invalidASNNode := node("node-invalid-asn", invalidASNIP, map[string]string{nodeASNAnnotation: "not-an-asn"})
+	rrServerNode := node("node-rr", rrServerIP, map[string]string{
+		nodeASNAnnotation:  "100",
+		rrServerAnnotation: "1",
+	})
+
+	sameASNPrefix := sameASNIP + "/32"
+	tests := []struct {
+		name        string
+		fullMesh    bool
+		rrClient    bool
+		nodes       []*v1core.Node
+		want        []string
+		checkExport bool
+	}{
+		{
+			name:        "overlapping eBGP address is not an iBGP peer",
+			nodes:       []*v1core.Node{localNode, sameASNNode, ebgpNode},
+			want:        []string{sameASNPrefix},
+			checkExport: true,
+		},
+		{
+			name:  "non-overlapping different ASN node is not an iBGP peer",
+			nodes: []*v1core.Node{localNode, sameASNNode, otherASNNode},
+			want:  []string{sameASNPrefix},
+		},
+		{
+			name:     "full mesh includes a different ASN node",
+			fullMesh: true,
+			nodes:    []*v1core.Node{localNode, sameASNNode, ebgpNode},
+			want:     []string{sameASNPrefix, ebgpIP + "/32"},
+		},
+		{
+			name: "missing or invalid ASN and the local node are omitted",
+			nodes: []*v1core.Node{
+				localNode, sameASNNode, missingASNNode, invalidASNNode,
+			},
+			want: []string{sameASNPrefix},
+		},
+		{
+			name:     "route reflector client includes only an rr server",
+			rrClient: true,
+			nodes:    []*v1core.Node{localNode, sameASNNode, rrServerNode},
+			want:     []string{rrServerIP + "/32"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientset := fake.NewSimpleClientset()
+			nrc := &NetworkRoutingController{
+				clientset:            clientset,
+				hostnameOverride:     "node-1",
+				routerID:             localIP,
+				localAddressList:     []string{"0.0.0.0"},
+				bgpPort:              10000,
+				bgpFullMeshMode:      tt.fullMesh,
+				bgpEnableInternal:    true,
+				advertisePodCidr:     false,
+				bgpRRClient:          tt.rrClient,
+				defaultNodeAsnNumber: 100,
+				nodeAsnNumber:        100,
+				podIPv4CIDRs:         []string{"172.20.0.0/24"},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						NodeName:  "node-1",
+						PrimaryIP: net.ParseIP(localIP),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{
+							v1core.NodeInternalIP: {net.ParseIP(localIP)},
+						},
+					},
+				},
+				globalPeerRouters: []*gobgpapi.Peer{{
+					Conf:      &gobgpapi.PeerConf{NeighborAddress: ebgpIP},
+					Transport: &gobgpapi.Transport{LocalAddress: localIP},
+				}},
+			}
+
+			nodes := make([]*v1core.Node, len(tt.nodes))
+			for n, nodeObj := range tt.nodes {
+				nodes[n] = nodeObj.DeepCopy()
+			}
+			if err := createNodes(clientset, nodes); err != nil {
+				t.Fatalf("failed to create nodes: %v", err)
+			}
+			startInformersForRoutes(t, nrc, clientset)
+			waitForListerWithTimeout(nrc.nodeLister, time.Second*10, t)
+			if got, want := len(nrc.nodeLister.List()), len(nodes); got != want {
+				t.Fatalf("node lister has %d nodes, want %d", got, want)
+			}
+
+			if err := nrc.startBgpServer(false); err != nil {
+				t.Fatalf("failed to start BGP server: %v", err)
+			}
+			defer func() {
+				if err := nrc.bgpServer.StopBgp(context.Background(), &gobgpapi.StopBgpRequest{}); err != nil {
+					t.Fatalf("failed to stop BGP server: %s", err)
+				}
+			}()
+
+			if err := nrc.AddPolicies(); err != nil {
+				t.Fatalf("AddPolicies() unexpected error: %v", err)
+			}
+
+			var got []string
+			err := nrc.bgpServer.ListDefinedSet(context.Background(), &gobgpapi.ListDefinedSetRequest{
+				DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_NEIGHBOR,
+				Name:        iBGPPeerSet,
+			}, func(ds *gobgpapi.DefinedSet) {
+				got = ds.GetList()
+			})
+			if err != nil {
+				t.Fatalf("listing %s: %v", iBGPPeerSet, err)
+			}
+			assert.ElementsMatch(t, tt.want, got)
+
+			if !tt.checkExport {
+				return
+			}
+			checkPolicies(t, PolicyTestCase{nrc: nrc}, gobgpapi.PolicyDirection_POLICY_DIRECTION_EXPORT,
+				[]*gobgpapi.Statement{{
+					Conditions: &gobgpapi.Conditions{
+						PrefixSet: &gobgpapi.MatchSet{
+							Type: gobgpapi.MatchSet_TYPE_ANY,
+							Name: podCIDRSet,
+						},
+						NeighborSet: &gobgpapi.MatchSet{
+							Type: gobgpapi.MatchSet_TYPE_ANY,
+							Name: iBGPPeerSet,
+						},
+					},
+					Actions: &gobgpapi.Actions{RouteAction: gobgpapi.RouteAction_ROUTE_ACTION_ACCEPT},
+				}})
+		})
+	}
+}

@@ -377,6 +377,44 @@ func (nrc *NetworkRoutingController) addiBGPPeersDefinedSet() (map[v1core.IPFami
 			klog.Errorf("Failed to find a node IP and therefore cannot add internal BGP Peer: %v", err)
 			continue
 		}
+
+		// skip self
+		if targetNode.GetPrimaryNodeIP().Equal(nrc.krNode.GetPrimaryNodeIP()) {
+			continue
+		}
+
+		// we are rr-client peer only with rr-server
+		if nrc.bgpRRClient {
+			if _, ok := nodeObj.Annotations[rrServerAnnotation]; !ok {
+				continue
+			}
+		}
+
+		// if node full mesh is not requested then just peer with nodes with same ASN
+		// (run iBGP among same ASN peers)
+		if !nrc.bgpFullMeshMode {
+			nodeasn, ok := nodeObj.Annotations[nodeASNAnnotation]
+			if !ok {
+				klog.Infof("Not peering with the Node %s as ASN number of the node is unknown.",
+					targetNode.GetPrimaryNodeIP().String())
+				continue
+			}
+
+			asnNo, err := strconv.ParseUint(nodeasn, 0, asnMaxBitSize)
+			if err != nil {
+				klog.Infof("Not peering with the Node %s as ASN number of the node is invalid.",
+					targetNode.GetPrimaryNodeIP().String())
+				continue
+			}
+
+			// if the nodes ASN number is different from ASN number of current node skip peering
+			if nrc.nodeAsnNumber != uint32(asnNo) {
+				klog.Infof("Not peering with the Node %s as ASN number of the node is different.",
+					targetNode.GetPrimaryNodeIP().String())
+				continue
+			}
+		}
+
 		if targetNode.GetPrimaryNodeIP().To4() != nil {
 			iBGPPeerCIDRs[v1core.IPv4Protocol] = append(iBGPPeerCIDRs[v1core.IPv4Protocol],
 				targetNode.GetPrimaryNodeIP().String()+"/32")
